@@ -350,6 +350,7 @@ class MainWindow(QMainWindow):
 
         self._pending = None
         self._write_queue = []
+        self._read_queue = []
         self._devices = []
 
         central = QWidget()
@@ -451,9 +452,26 @@ class MainWindow(QMainWindow):
     def _on_read(self):
         self.read_btn.setEnabled(False)
         self.write_btn.setEnabled(False)
-        self.status.showMessage("Reading profiles...")
-        self._pending = "read_profiles"
-        self.ble.enqueue("command", command={"cmd": "get_all"})
+        self.status.showMessage("Reading from device...")
+        self._pending = "read"
+        self._read_queue = []
+        for p in range(4):
+            self._read_queue.append({"cmd": "get", "profile": p})
+        for l in range(NUM_LOOPS):
+            self._read_queue.append({"cmd": "get_loop", "loop": l})
+        self._read_next()
+
+    def _read_next(self):
+        if not self._read_queue:
+            self.read_btn.setEnabled(True)
+            self.write_btn.setEnabled(True)
+            self.status.showMessage("All data loaded from device.")
+            self._pending = None
+            return
+        cmd = self._read_queue.pop(0)
+        what = f"profile {cmd['profile']}" if "profile" in cmd else f"loop {cmd['loop']}"
+        self.status.showMessage(f"Reading {what}...")
+        self.ble.enqueue("command", command=cmd)
 
     def _on_write(self):
         self.read_btn.setEnabled(False)
@@ -516,28 +534,19 @@ class MainWindow(QMainWindow):
             self.write_btn.setEnabled(True)
             self._pending = None
             self._write_queue.clear()
+            self._read_queue.clear()
             return
 
-        if self._pending == "read_profiles":
-            for prof in result.get("profiles", []):
-                pi = prof.get("profile", 0)
-                if 0 <= pi < 4:
-                    for bi, btn in enumerate(prof.get("buttons", [])):
-                        if bi < 3:
-                            self.pedal_widgets[pi][bi].set_config(btn)
-            self.status.showMessage("Profiles loaded. Reading loops...")
-            self._pending = "read_loops"
-            self.ble.enqueue("command", command={"cmd": "get_loops"})
-
-        elif self._pending == "read_loops":
-            for ld in result.get("loops", []):
-                li = ld.get("loop", 0)
-                if 0 <= li < NUM_LOOPS:
-                    self.loop_editors[li].set_config(ld)
-            self._pending = None
-            self.read_btn.setEnabled(True)
-            self.write_btn.setEnabled(True)
-            self.status.showMessage("All data loaded from device.")
+        if self._pending == "read":
+            pi = result.get("profile", -1)
+            if 0 <= pi < 4:
+                for bi, btn in enumerate(result.get("buttons", [])):
+                    if bi < 3:
+                        self.pedal_widgets[pi][bi].set_config(btn)
+            li = result.get("loop", -1)
+            if 0 <= li < NUM_LOOPS:
+                self.loop_editors[li].set_config(result)
+            self._read_next()
 
         elif self._pending == "write":
             if result.get("ok"):
@@ -556,6 +565,7 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.connect_btn.setEnabled(True)
         self._write_queue.clear()
+        self._read_queue.clear()
 
 
 if __name__ == "__main__":

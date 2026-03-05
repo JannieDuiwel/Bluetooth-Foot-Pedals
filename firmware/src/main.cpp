@@ -122,7 +122,7 @@ void ledOff() { setLED(0, 0, 0); }
 void loadDefaults() {
     for (int p = 0; p < NUM_PROFILES; p++)
         for (int b = 0; b < NUM_BUTTONS; b++)
-            profiles[p].buttons[b] = {0, 0, 0, 0, ""};
+            memset(&profiles[p].buttons[b], 0, sizeof(ButtonConfig));
     for (int l = 0; l < NUM_LOOPS; l++) {
         loops[l].numSteps = 0;
         loops[l].repeat = true;
@@ -407,6 +407,7 @@ void handleConfigCommand(const String &cmdStr) {
         response = "{\"error\":\"Unknown command\"}";
     }
 
+    Serial.printf("CMD: %s -> %d bytes\n", cmd, response.length());
     pResponseCharacteristic->setValue(response.c_str());
     pResponseCharacteristic->notify();
 }
@@ -454,6 +455,7 @@ void setup() {
     lastRotaryPos = activeProfile;
 
     bleKeyboard.begin();
+    BLEDevice::setMTU(517);
 
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new ConfigServerCallbacks());
