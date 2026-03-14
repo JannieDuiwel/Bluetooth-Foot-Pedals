@@ -1,12 +1,15 @@
 import sys
+import os
 import asyncio
 import json
+
+SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QComboBox, QCheckBox, QPushButton,
     QTabWidget, QLineEdit, QStatusBar, QSpinBox, QRadioButton,
-    QButtonGroup, QScrollArea, QFrame,
+    QButtonGroup, QScrollArea, QFrame, QSlider,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -223,7 +226,7 @@ class PedalWidget(QGroupBox):
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Type:"))
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["Key", "Loop"])
+        self.type_combo.addItems(["Key", "Loop", "Hold"])
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         type_row.addWidget(self.type_combo)
         type_row.addStretch()
@@ -283,7 +286,7 @@ class PedalWidget(QGroupBox):
         self.loop_widget.setVisible(False)
 
     def _on_type_changed(self, idx):
-        self.key_widget.setVisible(idx == 0)
+        self.key_widget.setVisible(idx in (0, 2))
         self.loop_widget.setVisible(idx == 1)
 
     def _auto_desc(self):
@@ -296,17 +299,18 @@ class PedalWidget(QGroupBox):
         self.desc_edit.setText("+".join(parts))
 
     def get_config(self):
-        if self.type_combo.currentIndex() == 0:
+        idx = self.type_combo.currentIndex()
+        if idx in (0, 2):  # Key or Hold
             mod = 0
             for name, bit in MODIFIER_BITS.items():
                 if self.mod_checks[name].isChecked():
                     mod |= bit
             return {
-                "type": 0, "mod": mod,
+                "type": idx, "mod": mod,
                 "key": KEY_MAP.get(self.key_combo.currentText(), 0),
                 "loop": 0, "desc": self.desc_edit.text(),
             }
-        else:
+        else:  # Loop
             li = self.loop_combo.currentIndex()
             return {"type": 1, "mod": 0, "key": 0, "loop": li, "desc": f"Loop {li+1}"}
 
@@ -314,7 +318,7 @@ class PedalWidget(QGroupBox):
         t = cfg.get("type", 0)
         self.type_combo.setCurrentIndex(t)
 
-        if t == 0:
+        if t in (0, 2):  # Key or Hold
             mod = cfg.get("mod", 0)
             for name, bit in MODIFIER_BITS.items():
                 self.mod_checks[name].setChecked(bool(mod & bit))
@@ -328,7 +332,7 @@ class PedalWidget(QGroupBox):
             desc = cfg.get("desc", "")
             if desc:
                 self.desc_edit.setText(desc)
-        else:
+        else:  # Loop
             li = cfg.get("loop", 0)
             if 0 <= li < NUM_LOOPS:
                 self.loop_combo.setCurrentIndex(li)
@@ -406,6 +410,43 @@ class MainWindow(QMainWindow):
         lo.addWidget(scroll)
         self.tabs.addTab(loops_page, "Loops")
 
+        # LED tab
+        led_page = QWidget()
+        led_layout = QVBoxLayout(led_page)
+        led_group = QGroupBox("LED Balance (per-channel PWM scale, 0–255)")
+        gl = QVBoxLayout(led_group)
+
+        self.led_sliders = {}
+        self.led_spins = {}
+        for ch, label in [("r", "Red"), ("g", "Green"), ("b", "Blue")]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{label}:"))
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(0, 255)
+            sl.setValue(200)
+            sp = QSpinBox()
+            sp.setRange(0, 255)
+            sp.setValue(200)
+            sp.setFixedWidth(60)
+            sl.valueChanged.connect(sp.setValue)
+            sp.valueChanged.connect(sl.setValue)
+            sl.valueChanged.connect(self._update_led_preview)
+            row.addWidget(sl)
+            row.addWidget(sp)
+            gl.addLayout(row)
+            self.led_sliders[ch] = sl
+            self.led_spins[ch] = sp
+
+        self.led_preview = QLabel("  Preview  ")
+        self.led_preview.setFixedHeight(40)
+        self.led_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gl.addWidget(self.led_preview)
+        self._update_led_preview()
+
+        led_layout.addWidget(led_group)
+        led_layout.addStretch()
+        self.tabs.addTab(led_page, "LED")
+
         root.addWidget(self.tabs)
 
         # action buttons
@@ -423,7 +464,35 @@ class MainWindow(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("Not connected. Click Scan to find your FootPedal.")
+        saved = self._load_saved_address()
+        if saved:
+            self._devices = [{"name": "FootPedal", "address": saved}]
+            self.device_combo.addItem(f"FootPedal ({saved})")
+            self.status.showMessage(f"Last device: {saved} — click Connect.")
+        else:
+            self.status.showMessage("Not connected. Click Scan to find your FootPedal.")
+
+    def _load_saved_address(self):
+        try:
+            with open(SETTINGS_FILE) as f:
+                return json.load(f).get("last_address")
+        except Exception:
+            return None
+
+    def _save_address(self, address):
+        try:
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump({"last_address": address}, f)
+        except Exception:
+            pass
+
+    def _update_led_preview(self):
+        r = self.led_sliders["r"].value()
+        g = self.led_sliders["g"].value()
+        b = self.led_sliders["b"].value()
+        self.led_preview.setStyleSheet(
+            f"background-color: rgb({r},{g},{b}); color: {'black' if r+g+b > 380 else 'white'};"
+        )
 
     def closeEvent(self, event):
         self.ble.stop()
@@ -459,6 +528,7 @@ class MainWindow(QMainWindow):
             self._read_queue.append({"cmd": "get", "profile": p})
         for l in range(NUM_LOOPS):
             self._read_queue.append({"cmd": "get_loop", "loop": l})
+        self._read_queue.append({"cmd": "get_led"})
         self._read_next()
 
     def _read_next(self):
@@ -469,7 +539,12 @@ class MainWindow(QMainWindow):
             self._pending = None
             return
         cmd = self._read_queue.pop(0)
-        what = f"profile {cmd['profile']}" if "profile" in cmd else f"loop {cmd['loop']}"
+        if "profile" in cmd:
+            what = f"profile {cmd['profile']}"
+        elif "loop" in cmd:
+            what = f"loop {cmd['loop']}"
+        else:
+            what = "LED settings"
         self.status.showMessage(f"Reading {what}...")
         self.ble.enqueue("command", command=cmd)
 
@@ -488,6 +563,12 @@ class MainWindow(QMainWindow):
                 "cmd": "set_loop", "loop": l,
                 "repeat": cfg["repeat"], "steps": cfg["steps"],
             })
+        self._write_queue.append({
+            "cmd": "set_led",
+            "r": self.led_sliders["r"].value(),
+            "g": self.led_sliders["g"].value(),
+            "b": self.led_sliders["b"].value(),
+        })
         self._write_next()
 
     def _write_next(self):
@@ -501,14 +582,22 @@ class MainWindow(QMainWindow):
 
     def _on_scan_done(self, devices):
         self.scan_btn.setEnabled(True)
-        self._devices = devices
         self.device_combo.clear()
-        for d in devices:
-            self.device_combo.addItem(f"{d['name']} ({d['address']})")
-        self.status.showMessage(
-            f"Found {len(devices)} device(s)." if devices
-            else "No FootPedal devices found. Is it powered on?"
-        )
+        if devices:
+            self._devices = devices
+            for d in devices:
+                self.device_combo.addItem(f"{d['name']} ({d['address']})")
+            self.status.showMessage(f"Found {len(devices)} device(s).")
+        else:
+            # Keep saved address in the list if scan found nothing
+            saved = self._load_saved_address()
+            if saved:
+                self._devices = [{"name": "FootPedal", "address": saved}]
+                self.device_combo.addItem(f"FootPedal ({saved})")
+                self.status.showMessage("Not found in scan — using last known address.")
+            else:
+                self._devices = []
+                self.status.showMessage("No FootPedal devices found. Is it powered on?")
 
     def _on_connect_done(self, ok):
         self.connect_btn.setEnabled(True)
@@ -517,8 +606,11 @@ class MainWindow(QMainWindow):
             self.read_btn.setEnabled(True)
             self.write_btn.setEnabled(True)
             self.status.showMessage("Connected via BLE!")
+            idx = self.device_combo.currentIndex()
+            if 0 <= idx < len(self._devices):
+                self._save_address(self._devices[idx]["address"])
         else:
-            self.status.showMessage("Connection failed.")
+            self.status.showMessage("Connection failed. Try Scan if device moved.")
 
     def _on_disconnect_done(self):
         self.connect_btn.setEnabled(True)
@@ -546,6 +638,10 @@ class MainWindow(QMainWindow):
             li = result.get("loop", -1)
             if 0 <= li < NUM_LOOPS:
                 self.loop_editors[li].set_config(result)
+            if result.get("led_scale"):
+                self.led_sliders["r"].setValue(result.get("r", 200))
+                self.led_sliders["g"].setValue(result.get("g", 200))
+                self.led_sliders["b"].setValue(result.get("b", 200))
             self._read_next()
 
         elif self._pending == "write":

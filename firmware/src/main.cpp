@@ -60,11 +60,26 @@ struct LoopConfig {
     bool repeat;
 };
 
-BleKeyboard bleKeyboard("FootPedal", "FootPedal", 100);
+// Subclass BleKeyboard to hook onStarted() so we can add the config service
+// to the SAME BLE server — avoids the two-server problem where onConnect()
+// never fires for the keyboard.
+class FootPedalKeyboard : public BleKeyboard {
+public:
+    FootPedalKeyboard() : BleKeyboard("FootPedal", "FootPedal", 100) {}
+protected:
+    void onStarted(BLEServer* pServer) override;
+    void onConnect(BLEServer* pServer) override {
+        BleKeyboard::onConnect(pServer);
+        // Keep advertising so the config app can still connect simultaneously
+        BLEDevice::startAdvertising();
+    }
+};
+FootPedalKeyboard bleKeyboard;
 Preferences preferences;
 
 Profile profiles[NUM_PROFILES];
 LoopConfig loops[NUM_LOOPS];
+uint8_t ledScale[3] = {200, 200, 200};  // per-channel PWM scale (R, G, B)
 int activeProfile = 0;
 
 int activeLoop = -1;
@@ -86,7 +101,6 @@ bool flashState = false;
 bool flashTimedOut = false;
 
 BLECharacteristic *pResponseCharacteristic = nullptr;
-bool configClientConnected = false;
 String pendingCommand = "";
 
 const uint8_t profileColors[NUM_PROFILES][3] = {
@@ -106,10 +120,26 @@ void pressKey(uint8_t modifier, uint8_t key) {
     bleKeyboard.releaseAll();
 }
 
+void holdKey(uint8_t modifier, uint8_t key) {
+    if (modifier & 0x01) bleKeyboard.press(KEY_LEFT_CTRL);
+    if (modifier & 0x02) bleKeyboard.press(KEY_LEFT_SHIFT);
+    if (modifier & 0x04) bleKeyboard.press(KEY_LEFT_ALT);
+    if (modifier & 0x08) bleKeyboard.press(KEY_LEFT_GUI);
+    bleKeyboard.press(key);
+}
+
+void releaseKey(uint8_t modifier, uint8_t key) {
+    bleKeyboard.release(key);
+    if (modifier & 0x01) bleKeyboard.release(KEY_LEFT_CTRL);
+    if (modifier & 0x02) bleKeyboard.release(KEY_LEFT_SHIFT);
+    if (modifier & 0x04) bleKeyboard.release(KEY_LEFT_ALT);
+    if (modifier & 0x08) bleKeyboard.release(KEY_LEFT_GUI);
+}
+
 void setLED(uint8_t r, uint8_t g, uint8_t b) {
-    ledcWrite(LED_R_CH, r);
-    ledcWrite(LED_G_CH, g);
-    ledcWrite(LED_B_CH, b);
+    ledcWrite(LED_R_CH, (uint16_t)r * ledScale[0] / 255);
+    ledcWrite(LED_G_CH, (uint16_t)g * ledScale[1] / 255);
+    ledcWrite(LED_B_CH, (uint16_t)b * ledScale[2] / 255);
 }
 
 void setProfileLED(int profile) {
@@ -170,6 +200,14 @@ void loadProfile(int index) {
     }
 }
 
+void saveLedScale() {
+    preferences.putBytes("led_scale", ledScale, 3);
+}
+
+void loadLedScale() {
+    preferences.getBytes("led_scale", ledScale, 3);
+}
+
 void saveLoop(int index) {
     JsonDocument doc;
     doc["repeat"] = loops[index].repeat;
@@ -214,6 +252,7 @@ void loadAllData() {
     preferences.begin("footpedal", true);
     for (int i = 0; i < NUM_PROFILES; i++) loadProfile(i);
     for (int i = 0; i < NUM_LOOPS; i++) loadLoop(i);
+    loadLedScale();
     preferences.end();
 }
 
@@ -403,6 +442,22 @@ void handleConfigCommand(const String &cmdStr) {
             response = "{\"ok\":true}";
         }
     }
+    else if (strcmp(cmd, "get_led") == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"led_scale\":true,\"r\":%d,\"g\":%d,\"b\":%d}",
+                 ledScale[0], ledScale[1], ledScale[2]);
+        response = buf;
+    }
+    else if (strcmp(cmd, "set_led") == 0) {
+        ledScale[0] = constrain((int)(doc["r"] | 200), 0, 255);
+        ledScale[1] = constrain((int)(doc["g"] | 200), 0, 255);
+        ledScale[2] = constrain((int)(doc["b"] | 200), 0, 255);
+        preferences.begin("footpedal", false);
+        saveLedScale();
+        preferences.end();
+        setProfileLED(activeProfile);
+        response = "{\"ok\":true}";
+    }
     else {
         response = "{\"error\":\"Unknown command\"}";
     }
@@ -412,23 +467,31 @@ void handleConfigCommand(const String &cmdStr) {
     pResponseCharacteristic->notify();
 }
 
-class ConfigServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer *pServer) override {
-        configClientConnected = true;
-        BLEDevice::startAdvertising();
-    }
-    void onDisconnect(BLEServer *pServer) override {
-        configClientConnected = false;
-        BLEDevice::startAdvertising();
-    }
-};
-
 class CmdCharCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) override {
         String value = pCharacteristic->getValue().c_str();
         if (value.length() > 0) pendingCommand = value;
     }
 };
+
+// Called by BleKeyboard::begin() after HID services are set up, before advertising.
+// We add our config service here so it shares the same BLE server and the
+// keyboard onConnect/onDisconnect callbacks fire correctly.
+void FootPedalKeyboard::onStarted(BLEServer* pServer) {
+    BLEService* pConfigService = pServer->createService(CONFIG_SERVICE_UUID);
+
+    BLECharacteristic* pCmdChar = pConfigService->createCharacteristic(
+        CONFIG_CMD_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
+    pCmdChar->setCallbacks(new CmdCharCallbacks());
+
+    pResponseCharacteristic = pConfigService->createCharacteristic(
+        CONFIG_RESPONSE_CHAR_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+    pResponseCharacteristic->addDescriptor(new BLE2902());
+
+    pConfigService->start();
+    Serial.println("Config service added to keyboard server.");
+}
 
 int readRotarySwitch() {
     for (int i = 0; i < NUM_PROFILES; i++)
@@ -454,28 +517,17 @@ void setup() {
     activeProfile = readRotarySwitch();
     lastRotaryPos = activeProfile;
 
+    // begin() calls onStarted() which adds the config service to the same server
+    Serial.println("Starting BLE...");
     bleKeyboard.begin();
+
+    // Override the library's SC+MITM+Bond security to plain Bond — much more
+    // compatible with Windows 11 without requiring passkey confirmation.
+    BLESecurity* pSec = new BLESecurity();
+    pSec->setAuthenticationMode(ESP_LE_AUTH_BOND);
+
     BLEDevice::setMTU(517);
-
-    BLEServer *pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new ConfigServerCallbacks());
-
-    BLEService *pConfigService = pServer->createService(CONFIG_SERVICE_UUID);
-
-    BLECharacteristic *pCmdChar = pConfigService->createCharacteristic(
-        CONFIG_CMD_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
-    pCmdChar->setCallbacks(new CmdCharCallbacks());
-
-    pResponseCharacteristic = pConfigService->createCharacteristic(
-        CONFIG_RESPONSE_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pResponseCharacteristic->addDescriptor(new BLE2902());
-
-    pConfigService->start();
-
-    BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-    pAdv->addServiceUUID(CONFIG_SERVICE_UUID);
-    pAdv->start();
+    Serial.println("BLE started. Setup complete.");
 
     disconnectTime = millis();
 }
@@ -527,9 +579,15 @@ void loop() {
                 } else if (cfg.type == 1) {
                     if (activeLoop == cfg.loopIndex) stopLoop();
                     else { stopLoop(); startLoop(cfg.loopIndex); }
+                } else if (cfg.type == 2 && cfg.key != 0) {
+                    holdKey(cfg.modifier, cfg.key);
                 }
             } else if (!pressed && pedalState[i]) {
                 pedalState[i] = false;
+                ButtonConfig &cfg = profiles[activeProfile].buttons[i];
+                if (cfg.type == 2 && cfg.key != 0) {
+                    releaseKey(cfg.modifier, cfg.key);
+                }
             }
         }
     }
