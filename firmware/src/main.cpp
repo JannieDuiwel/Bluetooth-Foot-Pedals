@@ -103,7 +103,7 @@ bool flashTimedOut = false;
 BLECharacteristic *pResponseCharacteristic = nullptr;
 String pendingCommand = "";
 
-const uint8_t profileColors[NUM_PROFILES][3] = {
+uint8_t profileColors[NUM_PROFILES][3] = {
     {255, 0,   0  },   // red
     {0,   255, 0  },   // green
     {0,   0,   255},   // blue
@@ -208,6 +208,14 @@ void loadLedScale() {
     preferences.getBytes("led_scale", ledScale, 3);
 }
 
+void saveProfileColors() {
+    preferences.putBytes("prof_colors", profileColors, sizeof(profileColors));
+}
+
+void loadProfileColors() {
+    preferences.getBytes("prof_colors", profileColors, sizeof(profileColors));
+}
+
 void saveLoop(int index) {
     JsonDocument doc;
     doc["repeat"] = loops[index].repeat;
@@ -253,6 +261,7 @@ void loadAllData() {
     for (int i = 0; i < NUM_PROFILES; i++) loadProfile(i);
     for (int i = 0; i < NUM_LOOPS; i++) loadLoop(i);
     loadLedScale();
+    loadProfileColors();
     preferences.end();
 }
 
@@ -457,6 +466,31 @@ void handleConfigCommand(const String &cmdStr) {
         preferences.end();
         setProfileLED(activeProfile);
         response = "{\"ok\":true}";
+    }
+    else if (strcmp(cmd, "get_colors") == 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "{\"colors\":[[%d,%d,%d],[%d,%d,%d],[%d,%d,%d],[%d,%d,%d]]}",
+            profileColors[0][0], profileColors[0][1], profileColors[0][2],
+            profileColors[1][0], profileColors[1][1], profileColors[1][2],
+            profileColors[2][0], profileColors[2][1], profileColors[2][2],
+            profileColors[3][0], profileColors[3][1], profileColors[3][2]);
+        response = buf;
+    }
+    else if (strcmp(cmd, "set_color") == 0) {
+        int p = doc["profile"] | -1;
+        if (p < 0 || p >= NUM_PROFILES) {
+            response = "{\"error\":\"Invalid profile\"}";
+        } else {
+            profileColors[p][0] = constrain((int)(doc["r"] | 0), 0, 255);
+            profileColors[p][1] = constrain((int)(doc["g"] | 0), 0, 255);
+            profileColors[p][2] = constrain((int)(doc["b"] | 0), 0, 255);
+            preferences.begin("footpedal", false);
+            saveProfileColors();
+            preferences.end();
+            setProfileLED(activeProfile);
+            response = "{\"ok\":true}";
+        }
     }
     else {
         response = "{\"error\":\"Unknown command\"}";

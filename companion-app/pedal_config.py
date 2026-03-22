@@ -35,6 +35,12 @@ KEY_MAP = {
 KEYCODE_TO_NAME = {v: k for k, v in KEY_MAP.items()}
 MODIFIER_BITS = {"Ctrl": 0x01, "Shift": 0x02, "Alt": 0x04, "Win": 0x08}
 PROFILE_NAMES = ["Profile 1", "Profile 2", "Profile 3", "Profile 4"]
+DEFAULT_PROFILE_COLORS = [
+    (255, 0, 0),      # red
+    (0, 255, 0),      # green
+    (0, 0, 255),      # blue
+    (255, 0, 255),    # purple
+]
 PEDAL_NAMES = ["Pedal 1 (Left)", "Pedal 2 (Center)", "Pedal 3 (Right)"]
 NUM_LOOPS = 3
 
@@ -444,6 +450,41 @@ class MainWindow(QMainWindow):
         self._update_led_preview()
 
         led_layout.addWidget(led_group)
+
+        # Profile colours
+        color_group = QGroupBox("Profile LED Colours")
+        cl = QVBoxLayout(color_group)
+        self.profile_color_sliders = []
+        for p_idx, p_name in enumerate(PROFILE_NAMES):
+            dr, dg, db = DEFAULT_PROFILE_COLORS[p_idx]
+            frame = QHBoxLayout()
+            frame.addWidget(QLabel(f"{p_name}:"))
+            sliders = {}
+            for ch, default in [("r", dr), ("g", dg), ("b", db)]:
+                sl = QSlider(Qt.Orientation.Horizontal)
+                sl.setRange(0, 255)
+                sl.setValue(default)
+                sl.setFixedWidth(80)
+                sp = QSpinBox()
+                sp.setRange(0, 255)
+                sp.setValue(default)
+                sp.setFixedWidth(50)
+                sl.valueChanged.connect(sp.setValue)
+                sp.valueChanged.connect(sl.setValue)
+                sl.valueChanged.connect(lambda _, pi=p_idx: self._update_profile_color_preview(pi))
+                frame.addWidget(QLabel(ch.upper()))
+                frame.addWidget(sl)
+                frame.addWidget(sp)
+                sliders[ch] = sl
+            preview = QLabel()
+            preview.setFixedSize(30, 30)
+            preview.setStyleSheet(f"background-color: rgb({dr},{dg},{db});")
+            frame.addWidget(preview)
+            sliders["preview"] = preview
+            cl.addLayout(frame)
+            self.profile_color_sliders.append(sliders)
+
+        led_layout.addWidget(color_group)
         led_layout.addStretch()
         self.tabs.addTab(led_page, "LED")
 
@@ -485,6 +526,11 @@ class MainWindow(QMainWindow):
                 json.dump({"last_address": address}, f)
         except Exception:
             pass
+
+    def _update_profile_color_preview(self, p_idx):
+        s = self.profile_color_sliders[p_idx]
+        r, g, b = s["r"].value(), s["g"].value(), s["b"].value()
+        s["preview"].setStyleSheet(f"background-color: rgb({r},{g},{b});")
 
     def _update_led_preview(self):
         r = self.led_sliders["r"].value()
@@ -529,6 +575,7 @@ class MainWindow(QMainWindow):
         for l in range(NUM_LOOPS):
             self._read_queue.append({"cmd": "get_loop", "loop": l})
         self._read_queue.append({"cmd": "get_led"})
+        self._read_queue.append({"cmd": "get_colors"})
         self._read_next()
 
     def _read_next(self):
@@ -543,6 +590,8 @@ class MainWindow(QMainWindow):
             what = f"profile {cmd['profile']}"
         elif "loop" in cmd:
             what = f"loop {cmd['loop']}"
+        elif cmd.get("cmd") == "get_colors":
+            what = "profile colours"
         else:
             what = "LED settings"
         self.status.showMessage(f"Reading {what}...")
@@ -569,6 +618,12 @@ class MainWindow(QMainWindow):
             "g": self.led_sliders["g"].value(),
             "b": self.led_sliders["b"].value(),
         })
+        for p_idx in range(4):
+            s = self.profile_color_sliders[p_idx]
+            self._write_queue.append({
+                "cmd": "set_color", "profile": p_idx,
+                "r": s["r"].value(), "g": s["g"].value(), "b": s["b"].value(),
+            })
         self._write_next()
 
     def _write_next(self):
@@ -621,6 +676,13 @@ class MainWindow(QMainWindow):
 
     def _on_command_done(self, result):
         if "error" in result:
+            # Silently skip unknown commands (firmware doesn't support yet)
+            if result.get("error") == "Unknown command":
+                if self._pending == "read":
+                    self._read_next()
+                elif self._pending == "write":
+                    self._write_next()
+                return
             self.status.showMessage(f"Error: {result['error']}")
             self.read_btn.setEnabled(True)
             self.write_btn.setEnabled(True)
@@ -642,6 +704,13 @@ class MainWindow(QMainWindow):
                 self.led_sliders["r"].setValue(result.get("r", 200))
                 self.led_sliders["g"].setValue(result.get("g", 200))
                 self.led_sliders["b"].setValue(result.get("b", 200))
+            if "colors" in result:
+                for p_idx, col in enumerate(result["colors"]):
+                    if p_idx < 4:
+                        s = self.profile_color_sliders[p_idx]
+                        s["r"].setValue(col[0])
+                        s["g"].setValue(col[1])
+                        s["b"].setValue(col[2])
             self._read_next()
 
         elif self._pending == "write":
