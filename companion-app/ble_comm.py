@@ -92,3 +92,9 @@ class BLEComm:
             "cmd": "set_loop", "loop": loop_index,
             "repeat": repeat, "steps": steps,
         })
+
+    async def set_wifi(self, ssid, password):
+        return await self.send_command({"cmd": "set_wifi", "ssid": ssid, "pass": password})
+
+    async def ota_check(self):
+        return await self.send_command({"cmd": "ota_check"}, timeout=120.0)

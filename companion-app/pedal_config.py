@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QComboBox, QCheckBox, QPushButton,
     QTabWidget, QLineEdit, QStatusBar, QSpinBox, QRadioButton,
-    QButtonGroup, QScrollArea, QFrame, QSlider,
+    QButtonGroup, QScrollArea, QFrame, QSlider, QProgressBar,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -232,7 +232,7 @@ class PedalWidget(QGroupBox):
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Type:"))
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["Key", "Loop", "Hold"])
+        self.type_combo.addItems(["Key", "Loop", "Hold", "Autoclicker"])
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         type_row.addWidget(self.type_combo)
         type_row.addStretch()
@@ -291,9 +291,44 @@ class PedalWidget(QGroupBox):
         main_layout.addWidget(self.loop_widget)
         self.loop_widget.setVisible(False)
 
+        # autoclicker config panel
+        self.ac_widget = QWidget()
+        al = QVBoxLayout(self.ac_widget)
+        al.setContentsMargins(0, 0, 0, 0)
+
+        hz_row = QHBoxLayout()
+        hz_row.addWidget(QLabel("Frequency:"))
+        self.ac_hz_spin = QSpinBox()
+        self.ac_hz_spin.setRange(1, 100)
+        self.ac_hz_spin.setValue(5)
+        self.ac_hz_spin.setSuffix(" Hz")
+        hz_row.addWidget(self.ac_hz_spin)
+        hz_row.addStretch()
+        al.addLayout(hz_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(QLabel("Button:"))
+        self.ac_btn_combo = QComboBox()
+        self.ac_btn_combo.addItems(["Left", "Right", "Middle"])
+        btn_row.addWidget(self.ac_btn_combo)
+        btn_row.addStretch()
+        al.addLayout(btn_row)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self.ac_mode_combo = QComboBox()
+        self.ac_mode_combo.addItems(["Hold (click while held)", "Toggle (press to start/stop)"])
+        mode_row.addWidget(self.ac_mode_combo)
+        mode_row.addStretch()
+        al.addLayout(mode_row)
+
+        main_layout.addWidget(self.ac_widget)
+        self.ac_widget.setVisible(False)
+
     def _on_type_changed(self, idx):
         self.key_widget.setVisible(idx in (0, 2))
         self.loop_widget.setVisible(idx == 1)
+        self.ac_widget.setVisible(idx == 3)
 
     def _auto_desc(self):
         kt = self.key_combo.currentText()
@@ -315,10 +350,19 @@ class PedalWidget(QGroupBox):
                 "type": idx, "mod": mod,
                 "key": KEY_MAP.get(self.key_combo.currentText(), 0),
                 "loop": 0, "desc": self.desc_edit.text(),
+                "chz": 5, "cbtn": 0, "cmode": 0,
             }
-        else:  # Loop
+        elif idx == 1:  # Loop
             li = self.loop_combo.currentIndex()
-            return {"type": 1, "mod": 0, "key": 0, "loop": li, "desc": f"Loop {li+1}"}
+            return {"type": 1, "mod": 0, "key": 0, "loop": li, "desc": f"Loop {li+1}",
+                    "chz": 5, "cbtn": 0, "cmode": 0}
+        else:  # Autoclicker
+            return {
+                "type": 3, "mod": 0, "key": 0, "loop": 0, "desc": "Autoclicker",
+                "chz": self.ac_hz_spin.value(),
+                "cbtn": self.ac_btn_combo.currentIndex(),
+                "cmode": self.ac_mode_combo.currentIndex(),
+            }
 
     def set_config(self, cfg):
         t = cfg.get("type", 0)
@@ -338,10 +382,14 @@ class PedalWidget(QGroupBox):
             desc = cfg.get("desc", "")
             if desc:
                 self.desc_edit.setText(desc)
-        else:  # Loop
+        elif t == 1:  # Loop
             li = cfg.get("loop", 0)
             if 0 <= li < NUM_LOOPS:
                 self.loop_combo.setCurrentIndex(li)
+        elif t == 3:  # Autoclicker
+            self.ac_hz_spin.setValue(max(1, min(100, cfg.get("chz", 5))))
+            self.ac_btn_combo.setCurrentIndex(max(0, min(2, cfg.get("cbtn", 0))))
+            self.ac_mode_combo.setCurrentIndex(max(0, min(1, cfg.get("cmode", 0))))
 
 
 class MainWindow(QMainWindow):
@@ -488,6 +536,48 @@ class MainWindow(QMainWindow):
         led_layout.addStretch()
         self.tabs.addTab(led_page, "LED")
 
+        # Device tab (WiFi + OTA)
+        device_page = QWidget()
+        device_layout = QVBoxLayout(device_page)
+
+        wifi_group = QGroupBox("WiFi Credentials")
+        wl = QVBoxLayout(wifi_group)
+        ssid_row = QHBoxLayout()
+        ssid_row.addWidget(QLabel("SSID:"))
+        self.wifi_ssid_edit = QLineEdit()
+        self.wifi_ssid_edit.setPlaceholderText("Network name")
+        ssid_row.addWidget(self.wifi_ssid_edit)
+        wl.addLayout(ssid_row)
+        pass_row = QHBoxLayout()
+        pass_row.addWidget(QLabel("Password:"))
+        self.wifi_pass_edit = QLineEdit()
+        self.wifi_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.wifi_pass_edit.setPlaceholderText("Network password")
+        pass_row.addWidget(self.wifi_pass_edit)
+        wl.addLayout(pass_row)
+        self.wifi_save_btn = QPushButton("Save to Device")
+        self.wifi_save_btn.setEnabled(False)
+        self.wifi_save_btn.clicked.connect(self._on_wifi_save)
+        wl.addWidget(self.wifi_save_btn)
+        device_layout.addWidget(wifi_group)
+
+        ota_group = QGroupBox("Firmware Update")
+        ol = QVBoxLayout(ota_group)
+        self.ota_status_label = QLabel("Connect to device to check for updates.")
+        ol.addWidget(self.ota_status_label)
+        self.ota_progress = QProgressBar()
+        self.ota_progress.setVisible(False)
+        self.ota_progress.setRange(0, 0)  # indeterminate
+        ol.addWidget(self.ota_progress)
+        self.ota_check_btn = QPushButton("Check for Update")
+        self.ota_check_btn.setEnabled(False)
+        self.ota_check_btn.clicked.connect(self._on_ota_check)
+        ol.addWidget(self.ota_check_btn)
+        device_layout.addWidget(ota_group)
+
+        device_layout.addStretch()
+        self.tabs.addTab(device_page, "Device")
+
         root.addWidget(self.tabs)
 
         # action buttons
@@ -626,6 +716,28 @@ class MainWindow(QMainWindow):
             })
         self._write_next()
 
+    def _on_wifi_save(self):
+        ssid = self.wifi_ssid_edit.text().strip()
+        if not ssid:
+            self.status.showMessage("Enter an SSID before saving.")
+            return
+        self.wifi_save_btn.setEnabled(False)
+        self.status.showMessage("Saving WiFi credentials to device...")
+        self._pending = "wifi"
+        self.ble.enqueue("command", command={
+            "cmd": "set_wifi",
+            "ssid": ssid,
+            "pass": self.wifi_pass_edit.text(),
+        })
+
+    def _on_ota_check(self):
+        self.ota_check_btn.setEnabled(False)
+        self.ota_status_label.setText("Checking for update...")
+        self.ota_progress.setVisible(True)
+        self.status.showMessage("OTA: checking for update...")
+        self._pending = "ota"
+        self.ble.enqueue("command", command={"cmd": "ota_check"})
+
     def _write_next(self):
         if not self._write_queue:
             self.read_btn.setEnabled(True)
@@ -660,6 +772,8 @@ class MainWindow(QMainWindow):
             self.connect_btn.setText("Disconnect")
             self.read_btn.setEnabled(True)
             self.write_btn.setEnabled(True)
+            self.wifi_save_btn.setEnabled(True)
+            self.ota_check_btn.setEnabled(True)
             self.status.showMessage("Connected via BLE!")
             idx = self.device_combo.currentIndex()
             if 0 <= idx < len(self._devices):
@@ -672,6 +786,8 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Connect")
         self.read_btn.setEnabled(False)
         self.write_btn.setEnabled(False)
+        self.wifi_save_btn.setEnabled(False)
+        self.ota_check_btn.setEnabled(False)
         self.status.showMessage("Disconnected.")
 
     def _on_command_done(self, result):
@@ -723,12 +839,56 @@ class MainWindow(QMainWindow):
                 self._pending = None
                 self._write_queue.clear()
 
+        elif self._pending == "wifi":
+            self.wifi_save_btn.setEnabled(True)
+            if result.get("ok"):
+                self.status.showMessage("WiFi credentials saved to device.")
+            else:
+                self.status.showMessage(f"WiFi save failed: {result.get('error', result)}")
+            self._pending = None
+
+        elif self._pending == "ota":
+            # ota_check returns {"ok":true} immediately, then notifies via ota_status
+            # Route ota_status notifications here too
+            ota = result.get("ota")
+            if ota == "checking":
+                self.ota_status_label.setText("Checking for update...")
+            elif ota == "up_to_date":
+                self.ota_status_label.setText("Firmware is up to date.")
+                self.ota_progress.setVisible(False)
+                self.ota_check_btn.setEnabled(True)
+                self.status.showMessage("OTA: firmware is up to date.")
+                self._pending = None
+            elif ota == "updating":
+                self.ota_status_label.setText("Downloading and flashing update...")
+            elif ota == "done":
+                self.ota_status_label.setText("Update complete. Device is restarting.")
+                self.ota_progress.setVisible(False)
+                self.ota_check_btn.setEnabled(True)
+                self.status.showMessage("OTA: update flashed. Device restarting.")
+                self._pending = None
+            elif ota == "error":
+                msg = result.get("msg", "Unknown error")
+                self.ota_status_label.setText(f"OTA error: {msg}")
+                self.ota_progress.setVisible(False)
+                self.ota_check_btn.setEnabled(True)
+                self.status.showMessage(f"OTA error: {msg}")
+                self._pending = None
+            elif result.get("ok"):
+                # Initial ack from ota_check — keep pending, wait for ota_status notifies
+                pass
+
     def _on_error(self, msg):
         self.status.showMessage(f"BLE Error: {msg}")
-        self.read_btn.setEnabled(self.ble.comm.is_connected)
-        self.write_btn.setEnabled(self.ble.comm.is_connected)
+        connected = self.ble.comm.is_connected
+        self.read_btn.setEnabled(connected)
+        self.write_btn.setEnabled(connected)
+        self.wifi_save_btn.setEnabled(connected)
+        self.ota_check_btn.setEnabled(connected)
+        self.ota_progress.setVisible(False)
         self.scan_btn.setEnabled(True)
         self.connect_btn.setEnabled(True)
+        self._pending = None
         self._write_queue.clear()
         self._read_queue.clear()
 

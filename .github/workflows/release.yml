@@ -1,0 +1,52 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        working-directory: firmware
+        run: pio run
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep -oP '(?<=#define VERSION ")[^"]+' firmware/src/main.cpp)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Delete existing release if same tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          gh release create "$TAG" \
+            firmware/.pio/build/esp32dev/firmware.bin \
+            --title "FootPedal $TAG" \
+            --notes "Automated build from commit ${{ github.sha }}"

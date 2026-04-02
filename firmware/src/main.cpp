@@ -1,11 +1,18 @@
 #include <Arduino.h>
 #include <BleKeyboard.h>
+#include <BleMouse.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Update.h>
+
+#define VERSION "1.2.0"
+#define GITHUB_REPO "JannieDuiwel/Bluetooth-Foot-Pedals"
 
 // Pin config
 #define PEDAL_1_PIN   32
@@ -37,11 +44,14 @@
 #define CONFIG_RESPONSE_CHAR_UUID  "a1b2c3d4-e5f6-7890-abcd-ef1234567892"
 
 struct ButtonConfig {
-    uint8_t type;       // 0=key, 1=loop
-    uint8_t modifier;   // bit0=Ctrl, bit1=Shift, bit2=Alt, bit3=GUI
+    uint8_t type;        // 0=key, 1=loop, 2=hold, 3=autoclicker
+    uint8_t modifier;    // bit0=Ctrl, bit1=Shift, bit2=Alt, bit3=GUI
     uint8_t key;
-    uint8_t loopIndex;  // which loop (0-2) when type=1
+    uint8_t loopIndex;   // which loop (0-2) when type=1
     char description[32];
+    uint8_t click_hz;    // autoclicker: 1-100 Hz
+    uint8_t click_button;// autoclicker: 0=left, 1=right, 2=middle
+    uint8_t click_mode;  // autoclicker: 0=hold, 1=toggle
 };
 
 struct Profile {
@@ -75,7 +85,12 @@ protected:
     }
 };
 FootPedalKeyboard bleKeyboard;
+BleMouse bleMouse("FootPedal", "FootPedal", 100);
 Preferences preferences;
+
+// Per-pedal autoclicker runtime state
+unsigned long acLastClickMs[NUM_BUTTONS] = {0, 0, 0};
+bool acToggleActive[NUM_BUTTONS] = {false, false, false};
 
 Profile profiles[NUM_PROFILES];
 LoopConfig loops[NUM_LOOPS];
@@ -150,9 +165,14 @@ void setProfileLED(int profile) {
 void ledOff() { setLED(0, 0, 0); }
 
 void loadDefaults() {
-    for (int p = 0; p < NUM_PROFILES; p++)
-        for (int b = 0; b < NUM_BUTTONS; b++)
+    for (int p = 0; p < NUM_PROFILES; p++) {
+        for (int b = 0; b < NUM_BUTTONS; b++) {
             memset(&profiles[p].buttons[b], 0, sizeof(ButtonConfig));
+            profiles[p].buttons[b].click_hz = 5;
+            profiles[p].buttons[b].click_button = 0;
+            profiles[p].buttons[b].click_mode = 0;
+        }
+    }
     for (int l = 0; l < NUM_LOOPS; l++) {
         loops[l].numSteps = 0;
         loops[l].repeat = true;
@@ -169,6 +189,9 @@ void saveProfile(int index) {
         btn["key"] = profiles[index].buttons[i].key;
         btn["loop"] = profiles[index].buttons[i].loopIndex;
         btn["desc"] = profiles[index].buttons[i].description;
+        btn["chz"] = profiles[index].buttons[i].click_hz;
+        btn["cbtn"] = profiles[index].buttons[i].click_button;
+        btn["cmode"] = profiles[index].buttons[i].click_mode;
     }
     String json;
     serializeJson(doc, json);
@@ -196,6 +219,9 @@ void loadProfile(int index) {
         profiles[index].buttons[i].loopIndex = btn["loop"] | 0;
         strlcpy(profiles[index].buttons[i].description, btn["desc"] | "",
                 sizeof(profiles[index].buttons[i].description));
+        profiles[index].buttons[i].click_hz = constrain((int)(btn["chz"] | 5), 1, 100);
+        profiles[index].buttons[i].click_button = constrain((int)(btn["cbtn"] | 0), 0, 2);
+        profiles[index].buttons[i].click_mode = constrain((int)(btn["cmode"] | 0), 0, 1);
         i++;
     }
 }
@@ -297,18 +323,23 @@ void tickLoop() {
 }
 
 // JSON serialization for BLE config responses
+static void serializeButton(JsonObject btn, const ButtonConfig &cfg) {
+    btn["type"] = cfg.type;
+    btn["mod"] = cfg.modifier;
+    btn["key"] = cfg.key;
+    btn["loop"] = cfg.loopIndex;
+    btn["desc"] = cfg.description;
+    btn["chz"] = cfg.click_hz;
+    btn["cbtn"] = cfg.click_button;
+    btn["cmode"] = cfg.click_mode;
+}
+
 String profileToJson(int index) {
     JsonDocument doc;
     doc["profile"] = index;
     JsonArray arr = doc["buttons"].to<JsonArray>();
-    for (int i = 0; i < NUM_BUTTONS; i++) {
-        JsonObject btn = arr.add<JsonObject>();
-        btn["type"] = profiles[index].buttons[i].type;
-        btn["mod"] = profiles[index].buttons[i].modifier;
-        btn["key"] = profiles[index].buttons[i].key;
-        btn["loop"] = profiles[index].buttons[i].loopIndex;
-        btn["desc"] = profiles[index].buttons[i].description;
-    }
+    for (int i = 0; i < NUM_BUTTONS; i++)
+        serializeButton(arr.add<JsonObject>(), profiles[index].buttons[i]);
     String json;
     serializeJson(doc, json);
     return json;
@@ -321,14 +352,8 @@ String allProfilesToJson() {
         JsonObject prof = arr.add<JsonObject>();
         prof["profile"] = p;
         JsonArray btns = prof["buttons"].to<JsonArray>();
-        for (int i = 0; i < NUM_BUTTONS; i++) {
-            JsonObject btn = btns.add<JsonObject>();
-            btn["type"] = profiles[p].buttons[i].type;
-            btn["mod"] = profiles[p].buttons[i].modifier;
-            btn["key"] = profiles[p].buttons[i].key;
-            btn["loop"] = profiles[p].buttons[i].loopIndex;
-            btn["desc"] = profiles[p].buttons[i].description;
-        }
+        for (int i = 0; i < NUM_BUTTONS; i++)
+            serializeButton(btns.add<JsonObject>(), profiles[p].buttons[i]);
     }
     String json;
     serializeJson(doc, json);
@@ -371,6 +396,121 @@ String allLoopsToJson() {
     return json;
 }
 
+void notifyOta(const char* status, const char* msg = nullptr) {
+    if (!pResponseCharacteristic) return;
+    char buf[128];
+    if (msg)
+        snprintf(buf, sizeof(buf), "{\"ota\":\"%s\",\"msg\":\"%s\"}", status, msg);
+    else
+        snprintf(buf, sizeof(buf), "{\"ota\":\"%s\"}", status);
+    pResponseCharacteristic->setValue(buf);
+    pResponseCharacteristic->notify();
+}
+
+void doOtaCheck() {
+    char ssid[64] = {0};
+    char pass[64] = {0};
+    preferences.begin("footpedal", true);
+    preferences.getString("wifi_ssid", ssid, sizeof(ssid));
+    preferences.getString("wifi_pass", pass, sizeof(pass));
+    preferences.end();
+
+    if (strlen(ssid) == 0) {
+        notifyOta("error", "No WiFi credentials");
+        return;
+    }
+
+    notifyOta("checking");
+    WiFi.begin(ssid, pass);
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) delay(200);
+
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect(true);
+        notifyOta("error", "WiFi connect failed");
+        return;
+    }
+
+    HTTPClient http;
+    http.begin("https://api.github.com/repos/" GITHUB_REPO "/releases/latest");
+    http.addHeader("User-Agent", "FootPedal/" VERSION);
+    int code = http.GET();
+    if (code != 200) {
+        http.end();
+        WiFi.disconnect(true);
+        notifyOta("error", "GitHub API failed");
+        return;
+    }
+
+    JsonDocument releaseDoc;
+    if (deserializeJson(releaseDoc, http.getStream())) {
+        http.end();
+        WiFi.disconnect(true);
+        notifyOta("error", "JSON parse failed");
+        return;
+    }
+    http.end();
+
+    const char* tag = releaseDoc["tag_name"];
+    if (!tag) { WiFi.disconnect(true); notifyOta("error", "No tag"); return; }
+
+    // Strip leading 'v' for comparison
+    const char* remoteVer = (tag[0] == 'v') ? tag + 1 : tag;
+    if (strcmp(remoteVer, VERSION) <= 0) {
+        WiFi.disconnect(true);
+        notifyOta("up_to_date");
+        return;
+    }
+
+    // Find firmware.bin asset
+    String binUrl;
+    for (JsonObject asset : releaseDoc["assets"].as<JsonArray>()) {
+        const char* name = asset["name"];
+        if (name && strcmp(name, "firmware.bin") == 0) {
+            binUrl = asset["browser_download_url"].as<String>();
+            break;
+        }
+    }
+    if (binUrl.isEmpty()) {
+        WiFi.disconnect(true);
+        notifyOta("error", "No firmware.bin asset");
+        return;
+    }
+
+    notifyOta("updating");
+    HTTPClient dlHttp;
+    dlHttp.begin(binUrl);
+    dlHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    int dlCode = dlHttp.GET();
+    if (dlCode != 200) {
+        dlHttp.end();
+        WiFi.disconnect(true);
+        notifyOta("error", "Download failed");
+        return;
+    }
+
+    int contentLen = dlHttp.getSize();
+    if (!Update.begin(contentLen > 0 ? contentLen : UPDATE_SIZE_UNKNOWN)) {
+        dlHttp.end();
+        WiFi.disconnect(true);
+        notifyOta("error", "Update.begin failed");
+        return;
+    }
+
+    size_t written = Update.writeStream(*dlHttp.getStreamPtr());
+    dlHttp.end();
+    WiFi.disconnect(true);
+
+    if (written != (size_t)contentLen || !Update.end(true)) {
+        notifyOta("error", "Flash write failed");
+        return;
+    }
+
+    notifyOta("done");
+    delay(500);
+    ESP.restart();
+}
+
 void handleConfigCommand(const String &cmdStr) {
     JsonDocument doc;
     if (deserializeJson(doc, cmdStr)) {
@@ -389,7 +529,7 @@ void handleConfigCommand(const String &cmdStr) {
     }
 
     if (strcmp(cmd, "ping") == 0) {
-        response = "{\"pong\":true,\"version\":\"1.1\"}";
+        response = "{\"pong\":true,\"version\":\"" VERSION "\"}";
     }
     else if (strcmp(cmd, "get") == 0) {
         int p = doc["profile"] | 0;
@@ -413,6 +553,9 @@ void handleConfigCommand(const String &cmdStr) {
                 profiles[p].buttons[i].loopIndex = btn["loop"] | 0;
                 strlcpy(profiles[p].buttons[i].description, btn["desc"] | "",
                         sizeof(profiles[p].buttons[i].description));
+                profiles[p].buttons[i].click_hz = constrain((int)(btn["chz"] | 5), 1, 100);
+                profiles[p].buttons[i].click_button = constrain((int)(btn["cbtn"] | 0), 0, 2);
+                profiles[p].buttons[i].click_mode = constrain((int)(btn["cmode"] | 0), 0, 1);
                 i++;
             }
             preferences.begin("footpedal", false);
@@ -492,6 +635,28 @@ void handleConfigCommand(const String &cmdStr) {
             response = "{\"ok\":true}";
         }
     }
+    else if (strcmp(cmd, "set_wifi") == 0) {
+        const char* ssid = doc["ssid"] | "";
+        const char* pass = doc["pass"] | "";
+        if (strlen(ssid) == 0) {
+            response = "{\"error\":\"Missing ssid\"}";
+        } else {
+            preferences.begin("footpedal", false);
+            preferences.putString("wifi_ssid", ssid);
+            preferences.putString("wifi_pass", pass);
+            preferences.end();
+            response = "{\"ok\":true}";
+        }
+    }
+    else if (strcmp(cmd, "ota_check") == 0) {
+        // Run OTA in a background task so this function returns and the BLE
+        // response is flushed before we block on WiFi/HTTP.
+        response = "{\"ok\":true}";
+        pResponseCharacteristic->setValue(response.c_str());
+        pResponseCharacteristic->notify();
+        doOtaCheck();
+        return;
+    }
     else {
         response = "{\"error\":\"Unknown command\"}";
     }
@@ -554,6 +719,7 @@ void setup() {
     // begin() calls onStarted() which adds the config service to the same server
     Serial.println("Starting BLE...");
     bleKeyboard.begin();
+    bleMouse.begin();
 
     // Override the library's SC+MITM+Bond security to plain Bond — much more
     // compatible with Windows 11 without requiring passkey confirmation.
@@ -564,6 +730,18 @@ void setup() {
     Serial.println("BLE started. Setup complete.");
 
     disconnectTime = millis();
+
+    // Check for OTA update on boot if WiFi credentials are stored
+    {
+        char ssid[64] = {0};
+        preferences.begin("footpedal", true);
+        preferences.getString("wifi_ssid", ssid, sizeof(ssid));
+        preferences.end();
+        if (strlen(ssid) > 0) {
+            Serial.println("WiFi credentials found, checking for OTA update...");
+            doOtaCheck();
+        }
+    }
 }
 
 void loop() {
@@ -603,10 +781,11 @@ void loop() {
     if (bleConnected) {
         for (int i = 0; i < NUM_BUTTONS; i++) {
             bool pressed = (digitalRead(pedalPins[i]) == LOW);
+            ButtonConfig &cfg = profiles[activeProfile].buttons[i];
+
             if (pressed && !pedalState[i] && (now - pedalDebounce[i] > DEBOUNCE_MS)) {
                 pedalDebounce[i] = now;
                 pedalState[i] = true;
-                ButtonConfig &cfg = profiles[activeProfile].buttons[i];
 
                 if (cfg.type == 0 && cfg.key != 0) {
                     pressKey(cfg.modifier, cfg.key);
@@ -615,15 +794,51 @@ void loop() {
                     else { stopLoop(); startLoop(cfg.loopIndex); }
                 } else if (cfg.type == 2 && cfg.key != 0) {
                     holdKey(cfg.modifier, cfg.key);
+                } else if (cfg.type == 3) {
+                    if (cfg.click_mode == 1) {
+                        // toggle mode: flip on press-down
+                        acToggleActive[i] = !acToggleActive[i];
+                        acLastClickMs[i] = now;
+                    }
+                    // hold mode: clicking starts via the acLastClickMs check below
                 }
             } else if (!pressed && pedalState[i]) {
                 pedalState[i] = false;
-                ButtonConfig &cfg = profiles[activeProfile].buttons[i];
                 if (cfg.type == 2 && cfg.key != 0) {
                     releaseKey(cfg.modifier, cfg.key);
+                } else if (cfg.type == 3 && cfg.click_mode == 0) {
+                    // hold mode: stop clicking on release
+                    acToggleActive[i] = false;
+                }
+            }
+
+            // Autoclicker ticking
+            if (cfg.type == 3) {
+                bool shouldClick = false;
+                if (cfg.click_mode == 0) {
+                    // hold mode: click while pedal is held
+                    shouldClick = pedalState[i];
+                } else {
+                    // toggle mode: click while toggled on
+                    shouldClick = acToggleActive[i];
+                }
+
+                if (shouldClick) {
+                    unsigned long intervalMs = 1000UL / constrain((int)cfg.click_hz, 1, 100);
+                    if (now - acLastClickMs[i] >= intervalMs) {
+                        acLastClickMs[i] = now;
+                        if (bleMouse.isConnected()) {
+                            if (cfg.click_button == 1) bleMouse.click(MOUSE_RIGHT);
+                            else if (cfg.click_button == 2) bleMouse.click(MOUSE_MIDDLE);
+                            else bleMouse.click(MOUSE_LEFT);
+                        }
+                    }
                 }
             }
         }
+    } else {
+        // BLE disconnected: cancel any active autoclicker toggles
+        for (int i = 0; i < NUM_BUTTONS; i++) acToggleActive[i] = false;
     }
 
     // run active loop
