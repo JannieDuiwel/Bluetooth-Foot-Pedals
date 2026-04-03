@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <BleKeyboard.h>
-#include <BleMouse.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
@@ -70,25 +69,12 @@ struct LoopConfig {
     bool repeat;
 };
 
-// Forward declarations so the two subclasses can reference each other.
-class FootPedalKeyboard;
-class FootPedalMouse;
-extern FootPedalKeyboard bleKeyboard;
-extern FootPedalMouse bleMouse;
-
-// Subclass BleMouse to restore keyboard as the server callback owner after
-// the mouse's taskServer sets itself. Without this, mouse's callbacks override
-// keyboard's and bleKeyboard.isConnected() never returns true.
-class FootPedalMouse : public BleMouse {
-public:
-    FootPedalMouse() : BleMouse("FootPedal", "FootPedal", 100) {}
-protected:
-    void onStarted(BLEServer* pServer) override;  // defined after keyboard class
-};
+// Mouse HID report characteristic — set up in FootPedalKeyboard::onStarted()
+// on the same server as the keyboard, avoiding any second-server issues.
+BLECharacteristic* pMouseInput = nullptr;
 
 // Subclass BleKeyboard to hook onStarted() so we can add the config service
-// to the SAME BLE server — avoids the two-server problem where onConnect()
-// never fires for the keyboard.
+// and mouse HID service to the SAME BLE server.
 class FootPedalKeyboard : public BleKeyboard {
 public:
     FootPedalKeyboard() : BleKeyboard("FootPedal", "FootPedal", 100) {}
@@ -96,22 +82,10 @@ protected:
     void onStarted(BLEServer* pServer) override;
     void onConnect(BLEServer* pServer) override {
         BleKeyboard::onConnect(pServer);
-        bleMouse.connectionStatus->connected = true;
         BLEDevice::startAdvertising();
-    }
-    void onDisconnect(BLEServer* pServer) override {
-        BleKeyboard::onDisconnect(pServer);
-        bleMouse.connectionStatus->connected = false;
     }
 };
 FootPedalKeyboard bleKeyboard;
-FootPedalMouse bleMouse;
-
-// After mouse finishes its taskServer setup (which sets pServer callbacks to
-// mouse's connectionStatus), immediately restore keyboard as callback owner.
-void FootPedalMouse::onStarted(BLEServer* pServer) {
-    pServer->setCallbacks(&bleKeyboard);
-}
 Preferences preferences;
 
 // Per-pedal autoclicker runtime state
@@ -133,6 +107,10 @@ unsigned long pedalDebounce[NUM_BUTTONS] = { 0, 0, 0 };
 
 const int rotaryPins[NUM_PROFILES] = { ROTARY_POS_1, ROTARY_POS_2, ROTARY_POS_3, ROTARY_POS_4 };
 int lastRotaryPos = -1;
+
+// Non-blocking mouse release state
+bool mousePendingRelease = false;
+unsigned long mouseReleaseTime = 0;
 
 bool bleConnected = false;
 bool wasBleConnected = false;
@@ -699,23 +677,44 @@ class CmdCharCallbacks : public BLECharacteristicCallbacks {
     }
 };
 
-// Called by BleKeyboard::begin() after HID services are set up, before advertising.
-// We add our config service here so it shares the same BLE server and the
-// keyboard onConnect/onDisconnect callbacks fire correctly.
-void FootPedalKeyboard::onStarted(BLEServer* pServer) {
-    BLEService* pConfigService = pServer->createService(CONFIG_SERVICE_UUID);
 
+void mousePress(uint8_t button) {
+    if (!pMouseInput || mousePendingRelease) return;
+    uint8_t report[4] = {button, 0, 0, 0};
+    pMouseInput->setValue(report, 4);
+    pMouseInput->notify();
+    mousePendingRelease = true;
+    mouseReleaseTime = millis() + 10;
+}
+
+void tickMouseRelease(unsigned long now) {
+    if (mousePendingRelease && now >= mouseReleaseTime) {
+        mousePendingRelease = false;
+        uint8_t report[4] = {0, 0, 0, 0};
+        pMouseInput->setValue(report, 4);
+        pMouseInput->notify();
+    }
+}
+
+// Called by BleKeyboard::begin() after HID services are set up, before advertising.
+// We add the config service here on the same server. Mouse is already included
+// as report ID 3 in the keyboard's HID descriptor (patched BleKeyboard library).
+void FootPedalKeyboard::onStarted(BLEServer* pServer) {
+    // inputMouse (report ID 3) was created by BleKeyboard::begin(); expose it.
+    pMouseInput = inputMouse;
+
+    // --- Config service ---
+    BLEService* pConfigService = pServer->createService(CONFIG_SERVICE_UUID);
     BLECharacteristic* pCmdChar = pConfigService->createCharacteristic(
         CONFIG_CMD_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
     pCmdChar->setCallbacks(new CmdCharCallbacks());
-
     pResponseCharacteristic = pConfigService->createCharacteristic(
         CONFIG_RESPONSE_CHAR_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
     pResponseCharacteristic->addDescriptor(new BLE2902());
-
     pConfigService->start();
-    Serial.println("Config service added to keyboard server.");
+
+    Serial.println("Config service added. Mouse report is in keyboard HID descriptor (ID 3).");
 }
 
 int readRotarySwitch() {
@@ -742,11 +741,9 @@ void setup() {
     activeProfile = readRotarySwitch();
     lastRotaryPos = activeProfile;
 
-    // Mouse begins first; FootPedalMouse::onStarted() will restore keyboard as
-    // the server callback owner after mouse's taskServer sets its own callbacks.
     Serial.println("Starting BLE...");
-    bleMouse.begin();
     bleKeyboard.begin();
+    // pMouseInput is assigned inside FootPedalKeyboard::onStarted() (called by begin()).
 
     // Override the library's SC+MITM+Bond security to plain Bond — much more
     // compatible with Windows 11 without requiring passkey confirmation.
@@ -854,9 +851,9 @@ void loop() {
                     unsigned long intervalMs = 1000UL / constrain((int)cfg.click_hz, 1, 100);
                     if (now - acLastClickMs[i] >= intervalMs) {
                         acLastClickMs[i] = now;
-                        if (cfg.click_button == 1) bleMouse.click(MOUSE_RIGHT);
-                            else if (cfg.click_button == 2) bleMouse.click(MOUSE_MIDDLE);
-                            else bleMouse.click(MOUSE_LEFT);
+                        if (cfg.click_button == 1) mousePress(0x02);
+                        else if (cfg.click_button == 2) mousePress(0x04);
+                        else mousePress(0x01);
                     }
                 }
             }
@@ -876,5 +873,6 @@ void loop() {
         pendingCommand = "";
     }
 
+    tickMouseRelease(now);
     delay(5);
 }

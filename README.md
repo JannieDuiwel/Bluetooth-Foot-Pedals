@@ -39,11 +39,11 @@ GPIO 18      RGB LED Blue        Via 220Ω resistor to LED anode (B)
     Pedal 1 ──┤ GPIO32    │
     Pedal 2 ──┤ GPIO33    │
     Pedal 3 ──┤ GPIO25    │
-              │           │         ┌──── 220Ω ──── R ──┐
+              │           │         ┌──── 220Ω ──── R ───┐
     Rot 1 ────┤ GPIO26    │         │                    │
-    Rot 2 ────┤ GPIO27  16├─────────┘    ┌── 220Ω ── G ─┤ RGB
+    Rot 2 ────┤ GPIO27  16├─────────┘    ┌── 220Ω ── G ──┤ RGB
     Rot 3 ────┤ GPIO14  17├──────────────┘               │ LED
-    Rot 4 ────┤ GPIO12  18├───────────── 220Ω ──── B ──┤
+    Rot 4 ────┤ GPIO12  18├───────────── 220Ω ──── B ────┤
               │           │                              │
               │       GND ├──────────────────────────────┘
               └───────────┘
@@ -65,12 +65,12 @@ GPIO 18      RGB LED Blue        Via 220Ω resistor to LED anode (B)
 
 ## Default Key Mappings
 
-| Profile | Pedal 1       | Pedal 2    | Pedal 3          |
-|---------|---------------|------------|------------------|
+| Profile | Pedal 1       | Pedal 2    | Pedal 3                |
+|---------|---------------|------------|------------------------|
 | 1       | Ctrl+Z (Undo) | Ctrl+S (Save) | Ctrl+Shift+Z (Redo) |
-| 2       | Page Up       | Space      | Page Down        |
-| 3       | Prev Track    | Play/Pause | Next Track       |
-| 4       | Left Arrow    | F5         | Right Arrow      |
+| 2       | Page Up       | Space      | Page Down              |
+| 3       | Prev Track    | Play/Pause | Next Track             |
+| 4       | Left Arrow    | F5         | Right Arrow            |
 
 ## Building the Firmware
 
