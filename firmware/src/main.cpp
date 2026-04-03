@@ -70,6 +70,22 @@ struct LoopConfig {
     bool repeat;
 };
 
+// Forward declarations so the two subclasses can reference each other.
+class FootPedalKeyboard;
+class FootPedalMouse;
+extern FootPedalKeyboard bleKeyboard;
+extern FootPedalMouse bleMouse;
+
+// Subclass BleMouse to restore keyboard as the server callback owner after
+// the mouse's taskServer sets itself. Without this, mouse's callbacks override
+// keyboard's and bleKeyboard.isConnected() never returns true.
+class FootPedalMouse : public BleMouse {
+public:
+    FootPedalMouse() : BleMouse("FootPedal", "FootPedal", 100) {}
+protected:
+    void onStarted(BLEServer* pServer) override;  // defined after keyboard class
+};
+
 // Subclass BleKeyboard to hook onStarted() so we can add the config service
 // to the SAME BLE server — avoids the two-server problem where onConnect()
 // never fires for the keyboard.
@@ -80,12 +96,22 @@ protected:
     void onStarted(BLEServer* pServer) override;
     void onConnect(BLEServer* pServer) override {
         BleKeyboard::onConnect(pServer);
-        // Keep advertising so the config app can still connect simultaneously
+        bleMouse.connectionStatus->connected = true;
         BLEDevice::startAdvertising();
+    }
+    void onDisconnect(BLEServer* pServer) override {
+        BleKeyboard::onDisconnect(pServer);
+        bleMouse.connectionStatus->connected = false;
     }
 };
 FootPedalKeyboard bleKeyboard;
-BleMouse bleMouse("FootPedal", "FootPedal", 100);
+FootPedalMouse bleMouse;
+
+// After mouse finishes its taskServer setup (which sets pServer callbacks to
+// mouse's connectionStatus), immediately restore keyboard as callback owner.
+void FootPedalMouse::onStarted(BLEServer* pServer) {
+    pServer->setCallbacks(&bleKeyboard);
+}
 Preferences preferences;
 
 // Per-pedal autoclicker runtime state
@@ -716,10 +742,11 @@ void setup() {
     activeProfile = readRotarySwitch();
     lastRotaryPos = activeProfile;
 
-    // begin() calls onStarted() which adds the config service to the same server
+    // Mouse begins first; FootPedalMouse::onStarted() will restore keyboard as
+    // the server callback owner after mouse's taskServer sets its own callbacks.
     Serial.println("Starting BLE...");
-    bleKeyboard.begin();
     bleMouse.begin();
+    bleKeyboard.begin();
 
     // Override the library's SC+MITM+Bond security to plain Bond — much more
     // compatible with Windows 11 without requiring passkey confirmation.
@@ -827,11 +854,9 @@ void loop() {
                     unsigned long intervalMs = 1000UL / constrain((int)cfg.click_hz, 1, 100);
                     if (now - acLastClickMs[i] >= intervalMs) {
                         acLastClickMs[i] = now;
-                        if (bleMouse.isConnected()) {
-                            if (cfg.click_button == 1) bleMouse.click(MOUSE_RIGHT);
+                        if (cfg.click_button == 1) bleMouse.click(MOUSE_RIGHT);
                             else if (cfg.click_button == 2) bleMouse.click(MOUSE_MIDDLE);
                             else bleMouse.click(MOUSE_LEFT);
-                        }
                     }
                 }
             }
