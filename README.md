@@ -112,6 +112,43 @@ pyinstaller build.spec
 ```
 The output EXE will be in `companion-app/dist/FootPedalConfigurator.exe`.
 
+## PC Macro Runner (no ESP32 required)
+
+A standalone desktop app that runs the same kind of loops/macros as the foot
+pedal system, but entirely on your PC — no ESP32 or Bluetooth hardware needed.
+It types the keystrokes itself and triggers loops with a **global hotkey**
+(works in any window) or **in-app Play/Stop buttons**.
+
+### Run
+```bash
+cd companion-app
+pip install -r requirements.txt
+python macro_runner.py
+```
+
+### Usage
+1. Click **+ Add Loop** to create a loop, give it a name.
+2. Add steps with **+ Add Step**. Each step has an **Action**:
+   - **Tap** — press a key/combo once; the time is the *delay* before the next step.
+   - **Hold** — press a key/combo and hold it down for the set time, then release.
+   - **Wait** — do nothing for the set time (a pause between steps).
+3. Choose **Repeat continuously** or **Run once**.
+4. Click **Set Hotkey** and press the key combo you want (e.g. `F8`), then press
+   that hotkey in any window to start/stop the loop. Or use the **Play/Stop**
+   buttons in the app.
+5. Loops and hotkeys are saved to `companion-app/macro_settings.json` (on **Save**
+   and on exit) and reloaded on the next launch.
+
+> Tip: prefer the global hotkey — keystrokes go to whichever window is focused,
+> so clicking **Play** inside the app types into the previously focused window.
+
+### Build Distributable EXE
+```bash
+cd companion-app
+pyinstaller macro_runner.spec
+```
+The output EXE will be in `companion-app/dist/MacroRunner.exe`.
+
 ## Usage
 
 1. Flash the firmware to your ESP32

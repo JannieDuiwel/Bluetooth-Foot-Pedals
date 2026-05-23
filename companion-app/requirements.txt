@@ -1,3 +1,4 @@
 PyQt6>=6.6.0
 bleak>=0.21.0
+keyboard>=0.13.5
 pyinstaller>=6.0.0

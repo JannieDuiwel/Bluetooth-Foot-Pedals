@@ -18,6 +18,10 @@ firmware/.vscode/
 *.spec.bak
 companion-app/dist/
 
+# App runtime state (per-user)
+companion-app/settings.json
+companion-app/macro_settings.json
+
 # OS
 Thumbs.db
 .DS_Store
