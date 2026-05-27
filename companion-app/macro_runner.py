@@ -14,6 +14,7 @@ import sys
 import os
 import json
 import threading
+import time
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -24,6 +25,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, QEvent, pyqtSignal
 
 import keyboard
+
+from loop_logic import duration_to_seconds, loop_should_continue, normalize_mode_config
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "macro_settings.json")
 
@@ -63,6 +66,18 @@ def step_to_combo(mods, key):
     parts = [MODIFIERS[m] for m in mods if m in MODIFIERS]
     parts.append(key_to_kb(key))
     return "+".join(parts)
+
+
+def _mode_suffix(cfg):
+    """Short parenthetical describing a loop's run limit, for the status bar."""
+    mode = cfg["mode"]
+    if mode == "once":
+        return " (once)"
+    if mode == "count":
+        return f" ({cfg['repeat_count']}x)"
+    if mode == "duration":
+        return f" (for {cfg['duration_value']} {cfg['duration_unit']})"
+    return ""  # continuous
 
 
 class LoopStepWidget(QFrame):
@@ -154,7 +169,7 @@ class LoopPlayer(QThread):
     """Runs one loop's steps until stopped or (run-once) finished."""
     finished_playing = pyqtSignal()
 
-    def __init__(self, steps, repeat):
+    def __init__(self, steps, mode, repeat_count, duration_seconds):
         super().__init__()
         # Pre-compute (action, combo, duration_seconds) so we touch no GUI in run().
         self._plan = [
@@ -163,13 +178,17 @@ class LoopPlayer(QThread):
              max(10, s["delay"]) / 1000.0)
             for s in steps
         ]
-        self._repeat = repeat
+        self._mode = mode
+        self._repeat_count = repeat_count
+        self._duration_seconds = duration_seconds
         self._stop = threading.Event()
 
     def run(self):
         if not self._plan:
             self.finished_playing.emit()
             return
+        start = time.monotonic()
+        completed = 0
         try:
             while not self._stop.is_set():
                 for action, combo, dur in self._plan:
@@ -200,7 +219,16 @@ class LoopPlayer(QThread):
                         # Wait, or a key-less tap/hold: just pause for the duration.
                         if self._stop.wait(dur):
                             break
-                if not self._repeat:
+                # A full pass finished. Decide at this boundary whether to do
+                # another — so the current pass always completes ("finish current
+                # iteration"), and the duration limit is a floor, not a hard cap.
+                completed += 1
+                if self._stop.is_set():
+                    break
+                if not loop_should_continue(
+                    self._mode, completed, self._repeat_count,
+                    time.monotonic() - start, self._duration_seconds,
+                ):
                     break
         finally:
             self.finished_playing.emit()
@@ -234,19 +262,49 @@ class LoopCard(QGroupBox):
         top.addWidget(rm_loop)
         layout.addLayout(top)
 
-        # mode
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Mode:"))
-        self.repeat_radio = QRadioButton("Repeat continuously")
+        # mode — four mutually-exclusive options across two rows
+        self.mode_group = QButtonGroup(self)
         self.once_radio = QRadioButton("Run once")
-        self.repeat_radio.setChecked(True)
-        grp = QButtonGroup(self)
-        grp.addButton(self.repeat_radio)
-        grp.addButton(self.once_radio)
-        mode_row.addWidget(self.repeat_radio)
-        mode_row.addWidget(self.once_radio)
-        mode_row.addStretch()
-        layout.addLayout(mode_row)
+        self.continuous_radio = QRadioButton("Repeat continuously")
+        self.count_radio = QRadioButton("Repeat")
+        self.duration_radio = QRadioButton("Repeat for")
+        for rb in (self.once_radio, self.continuous_radio,
+                   self.count_radio, self.duration_radio):
+            self.mode_group.addButton(rb)
+        self.continuous_radio.setChecked(True)
+
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 100000)
+        self.count_spin.setValue(10)
+
+        self.duration_spin = QSpinBox()
+        self.duration_spin.setRange(1, 100000)
+        self.duration_spin.setValue(5)
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(["Seconds", "Minutes"])
+        self.unit_combo.setCurrentText("Minutes")
+
+        mode_row1 = QHBoxLayout()
+        mode_row1.addWidget(QLabel("Mode:"))
+        mode_row1.addWidget(self.once_radio)
+        mode_row1.addWidget(self.continuous_radio)
+        mode_row1.addStretch()
+        layout.addLayout(mode_row1)
+
+        mode_row2 = QHBoxLayout()
+        mode_row2.addSpacing(40)
+        mode_row2.addWidget(self.count_radio)
+        mode_row2.addWidget(self.count_spin)
+        mode_row2.addWidget(QLabel("times"))
+        mode_row2.addSpacing(20)
+        mode_row2.addWidget(self.duration_radio)
+        mode_row2.addWidget(self.duration_spin)
+        mode_row2.addWidget(self.unit_combo)
+        mode_row2.addStretch()
+        layout.addLayout(mode_row2)
+
+        self.mode_group.buttonToggled.connect(self._on_mode_changed)
+        self._on_mode_changed()
 
         # hotkey + play/stop
         ctl_row = QHBoxLayout()
@@ -279,6 +337,22 @@ class LoopCard(QGroupBox):
         add_btn = QPushButton("+ Add Step")
         add_btn.clicked.connect(self._add_step)
         layout.addWidget(add_btn)
+
+    # --- mode ---
+    def _on_mode_changed(self, *args):
+        # Only the selected mode's inputs are editable.
+        self.count_spin.setEnabled(self.count_radio.isChecked())
+        self.duration_spin.setEnabled(self.duration_radio.isChecked())
+        self.unit_combo.setEnabled(self.duration_radio.isChecked())
+
+    def _current_mode(self):
+        if self.once_radio.isChecked():
+            return "once"
+        if self.count_radio.isChecked():
+            return "count"
+        if self.duration_radio.isChecked():
+            return "duration"
+        return "continuous"
 
     # --- steps ---
     def _add_step(self):
@@ -329,7 +403,10 @@ class LoopCard(QGroupBox):
         return {
             "name": self.name_edit.text(),
             "hotkey": self.hotkey,
-            "repeat": self.repeat_radio.isChecked(),
+            "mode": self._current_mode(),
+            "repeat_count": self.count_spin.value(),
+            "duration_value": self.duration_spin.value(),
+            "duration_unit": self.unit_combo.currentText().lower(),
             "steps": [s.get_config() for s in self.step_widgets],
         }
 
@@ -337,9 +414,19 @@ class LoopCard(QGroupBox):
         self.name_edit.setText(cfg.get("name", "Loop"))
         self.hotkey = cfg.get("hotkey", "")
         self.hotkey_field.setText(self.hotkey)
-        repeat = cfg.get("repeat", True)
-        self.repeat_radio.setChecked(repeat)
-        self.once_radio.setChecked(not repeat)
+        m = normalize_mode_config(cfg)
+        self.count_spin.setValue(m["repeat_count"])
+        self.duration_spin.setValue(m["duration_value"])
+        ui = self.unit_combo.findText(m["duration_unit"].capitalize())
+        self.unit_combo.setCurrentIndex(ui if ui >= 0 else self.unit_combo.findText("Minutes"))
+        radios = {
+            "once": self.once_radio,
+            "continuous": self.continuous_radio,
+            "count": self.count_radio,
+            "duration": self.duration_radio,
+        }
+        radios.get(m["mode"], self.continuous_radio).setChecked(True)
+        self._on_mode_changed()
         for sw in self.step_widgets[:]:
             self.steps_layout.removeWidget(sw)
             sw.deleteLater()
@@ -452,12 +539,13 @@ class MainWindow(QMainWindow):
         if not cfg["steps"]:
             self.status.showMessage(f"{cfg['name']}: add at least one step first.")
             return
-        player = LoopPlayer(cfg["steps"], cfg["repeat"])
+        dur_s = duration_to_seconds(cfg["duration_value"], cfg["duration_unit"])
+        player = LoopPlayer(cfg["steps"], cfg["mode"], cfg["repeat_count"], dur_s)
         player.finished_playing.connect(lambda c=card: self._on_player_finished(c))
         self.players[card] = player
         card.set_running(True)
         player.start()
-        self.status.showMessage(f"Playing: {cfg['name']}")
+        self.status.showMessage(f"Playing: {cfg['name']}{_mode_suffix(cfg)}")
 
     def _stop_card(self, card):
         player = self.players.get(card)
