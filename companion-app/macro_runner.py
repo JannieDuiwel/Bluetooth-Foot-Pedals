@@ -70,7 +70,7 @@ def step_to_combo(mods, key):
 
 def _mode_suffix(cfg):
     """Short parenthetical describing a loop's run limit, for the status bar."""
-    mode = cfg["mode"]
+    mode = cfg.get("mode", "continuous")
     if mode == "once":
         return " (once)"
     if mode == "count":
@@ -304,7 +304,7 @@ class LoopCard(QGroupBox):
         layout.addLayout(mode_row2)
 
         self.mode_group.buttonToggled.connect(self._on_mode_changed)
-        self._on_mode_changed()
+        self._on_mode_changed()  # bootstrap: setChecked above fired before this was connected
 
         # hotkey + play/stop
         ctl_row = QHBoxLayout()
@@ -418,7 +418,7 @@ class LoopCard(QGroupBox):
         self.count_spin.setValue(m["repeat_count"])
         self.duration_spin.setValue(m["duration_value"])
         ui = self.unit_combo.findText(m["duration_unit"].capitalize())
-        self.unit_combo.setCurrentIndex(ui if ui >= 0 else self.unit_combo.findText("Minutes"))
+        self.unit_combo.setCurrentIndex(ui if ui >= 0 else 1)  # 1 = "Minutes" fallback
         radios = {
             "once": self.once_radio,
             "continuous": self.continuous_radio,
