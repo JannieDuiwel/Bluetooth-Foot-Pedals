@@ -132,7 +132,13 @@ python macro_runner.py
    - **Tap** — press a key/combo once; the time is the *delay* before the next step.
    - **Hold** — press a key/combo and hold it down for the set time, then release.
    - **Wait** — do nothing for the set time (a pause between steps).
-3. Choose **Repeat continuously** or **Run once**.
+3. Choose a **Mode**:
+   - **Run once** — play the steps a single time, then stop.
+   - **Repeat continuously** — repeat until you stop it.
+   - **Repeat _N_ times** — repeat the whole sequence a set number of times.
+   - **Repeat for** a number of **Seconds**/**Minutes** — repeat until the time
+     is up. The pass in progress always finishes, so a run can slightly exceed
+     the limit.
 4. Click **Set Hotkey** and press the key combo you want (e.g. `F8`), then press
    that hotkey in any window to start/stop the loop. Or use the **Play/Stop**
    buttons in the app.
